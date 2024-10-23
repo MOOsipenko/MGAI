@@ -119,6 +119,10 @@ class IDesign:
             print("Extracted Architect JSON:", architect_response_clean)  # Debugging line
 
             # Load extracted JSON strings into dictionaries
+            print()
+            print()
+            print("HOBA")
+            print(designer_response_clean)
             designer_response_json = json.loads(designer_response_clean)
             architect_response_json = json.loads(architect_response_clean)
 
