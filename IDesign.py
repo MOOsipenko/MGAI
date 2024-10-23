@@ -128,6 +128,7 @@ class IDesign:
             print()
             print("HOBA")
             print(designer_response_clean)
+            designer_response_clean = str(designer_response_clean).replace("'", '"')
             designer_response_json = json.loads(str(designer_response_clean))
             architect_response_json = json.loads(architect_response_clean)
 
