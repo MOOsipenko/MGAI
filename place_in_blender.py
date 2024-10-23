@@ -1,147 +1,124 @@
-import bpy
+import autogen
+from autogen import AssistantAgent, UserProxyAgent
+from copy import deepcopy
+from jsonschema import validate
 import json
-import math
-import os
+import re
 
-object_name = 'Cube'
-object_to_delete = bpy.data.objects.get(object_name)
-
-# Check if the object exists before trying to delete it
-if object_to_delete is not None:
-    bpy.data.objects.remove(object_to_delete, do_unlink=True)
-
-def import_glb(file_path, object_name):
-    bpy.ops.import_scene.gltf(filepath=file_path)
-    imported_object = bpy.context.view_layer.objects.active
-    if imported_object is not None:
-        imported_object.name = object_name
-
-def create_room(width, depth, height):
-    # Create floor
-    bpy.ops.mesh.primitive_plane_add(size=1, enter_editmode=False, align='WORLD', location=(0, 0, 0))
-
-    # Extrude to create walls
-    bpy.ops.object.mode_set(mode='EDIT')
-    bpy.ops.mesh.extrude_region_move(TRANSFORM_OT_translate={"value":(0, 0, height)})
-    bpy.ops.object.mode_set(mode='OBJECT')
-
-    # Scale the walls to the desired dimensions
-    bpy.ops.transform.resize(value=(width, depth, 1))
-
-    bpy.context.active_object.location.x += width / 2
-    bpy.context.active_object.location.y += depth / 2
-
-def find_glb_files(directory):
-    glb_files = {}
-    for root, dirs, files in os.walk(directory):
-        for file in files:
-            if file.endswith(".glb"):
-                key = file.split(".")[0]
-                if key not in glb_files:
-                    glb_files[key] = os.path.join(root, file)
-    return glb_files
-
-def get_highest_parent_objects():
-    highest_parent_objects = []
-
-    for obj in bpy.data.objects:
-        # Check if the object has no parent
-        if obj.parent is None:
-            highest_parent_objects.append(obj)
-    return highest_parent_objects
-
-def delete_empty_objects():
-    # Iterate through all objects in the scene
-    for obj in bpy.context.scene.objects:
-        # Check if the object is empty (has no geometry)
-        print(obj.name, obj.type)
-        if obj.type == 'EMPTY':
-            bpy.context.view_layer.objects.active = obj
-            bpy.data.objects.remove(obj)
-
-def select_meshes_under_empty(empty_object_name):
-    # Get the empty object
-    empty_object = bpy.data.objects.get(empty_object_name)
-    print(empty_object is not None)
-    if empty_object is not None and empty_object.type == 'EMPTY':
-        # Iterate through the children of the empty object
-        for child in empty_object.children:
-            # Check if the child is a mesh
-            if child.type == 'MESH':
-                # Select the mesh
-                child.select_set(True)
-                bpy.context.view_layer.objects.active = child
-            else:
-                select_meshes_under_empty(child.name)
-
-def rescale_object(obj, scale):
-    # Ensure the object has a mesh data
-    if obj.type == 'MESH':
-        bbox_dimensions = obj.dimensions
-        scale_factors = (
-                         scale["length"] / bbox_dimensions.x, 
-                         scale["width"] / bbox_dimensions.y, 
-                         scale["height"] / bbox_dimensions.z
-                        )
-        obj.scale = scale_factors
+from schemas import layout_corrector_schema, deletion_schema
+from agents import is_termination_msg
 
 
-objects_in_room = {}
-file_path = "scene_graph.json"
-with open(file_path, 'r') as file:
-    data = json.load(file)
-    for item in data:
-        if item["new_object_id"] not in ["south_wall", "north_wall", "east_wall", "west_wall", "middle of the room", "ceiling"]:
-            objects_in_room[item["new_object_id"]] = item
+class JSONSchemaAgent(UserProxyAgent):
+    def __init__(self, name: str, is_termination_msg):
+        super().__init__(name, is_termination_msg=is_termination_msg)
 
-directory_path = os.path.join(os.getcwd(), "Assets")
-glb_file_paths = find_glb_files(directory_path)
+    def get_human_input(self, prompt: str) -> str:
+        message = self.last_message()
+        preps_layout = ["left-side", "right-side", "in the middle"]
+        preps_objs = ['on', 'left of', 'right of', 'in front', 'behind', 'under', 'above']
 
-for item_id, object_in_room in objects_in_room.items():
-    glb_file_path = os.path.join(directory_path, glb_file_paths[item_id])
-    import_glb(glb_file_path, item_id)
+        # Extract JSON content from the message using regex
+        pattern = r'```json\s*([^`]+)\s*```'  # Match the JSON object
+        match = re.search(pattern, message["content"], re.DOTALL)
+        
+        if not match:
+            return "Invalid format: No JSON object found in the message."
 
-parents = get_highest_parent_objects()
-empty_parents = [parent for parent in parents if parent.type == "EMPTY"]
-print(empty_parents)
+        json_obj_new = json.loads(match.group(1))
 
-for empty_parent in empty_parents:
-    bpy.ops.object.select_all(action='DESELECT')
-    select_meshes_under_empty(empty_parent.name)
-    
-    bpy.ops.object.join()
-    bpy.ops.object.origin_set(type='ORIGIN_GEOMETRY', center='BOUNDS')
-    
-    joined_object = bpy.context.view_layer.objects.active
-    if joined_object is not None:
-        joined_object.name = empty_parent.name + "-joined"
+        is_success = False
+        try:
+            validate(instance=json_obj_new, schema=layout_corrector_schema)
+            return "SUCCESS"
+        except Exception as e:
+            feedback = str(e)
+            if "enum" in feedback:
+                if any(prep in feedback for prep in preps_objs):
+                    feedback += f" Change the preposition {e.instance} to something suitable from {preps_objs}."
+                elif any(prep in feedback for prep in preps_layout):
+                    feedback += f" Change the preposition {e.instance} to something suitable from {preps_layout}."
+        
+        return feedback
 
-bpy.context.view_layer.objects.active = None
 
-MSH_OBJS = [m for m in bpy.context.scene.objects if m.type == 'MESH']
-for OBJS in MSH_OBJS:
-    bpy.context.view_layer.objects.active = OBJS
-    bpy.ops.object.parent_clear(type='CLEAR_KEEP_TRANSFORM')
-    OBJS.location = (0.0, 0.0, 0.0)
-    bpy.context.view_layer.objects.active = OBJS
-    OBJS.select_set(True)
-    bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
-    bpy.ops.object.origin_set(type='ORIGIN_GEOMETRY', center='BOUNDS')
+# Load the Groq Llama models for both vision and language tasks
+config_list_llama_vision = autogen.config_list_from_json(
+    "OAI_CONFIG_LIST.json",
+    filter_dict={
+        "model": ["llama-3.2-11b-vision-preview"],
+    },
+)
 
-MSH_OBJS = [m for m in bpy.context.scene.objects if m.type == 'MESH']
-for OBJS in MSH_OBJS:
-    item = objects_in_room[OBJS.name.split("-")[0]]
-    object_position = (item["position"]["x"], item["position"]["y"], item["position"]["z"])  # X, Y, and Z coordinates
-    object_rotation_z = (item["rotation"]["z_angle"] / 180.0) * math.pi + math.pi # Rotation angles in radians around the X, Y, and Z axes
-    
-    bpy.ops.object.select_all(action='DESELECT')
-    OBJS.select_set(True)
-    OBJS.location = object_position
-    bpy.ops.transform.rotate(value=object_rotation_z,  orient_axis='Z')
-    rescale_object(OBJS, item["size_in_meters"])
+config_list_llama_language = autogen.config_list_from_json(
+    "OAI_CONFIG_LIST.json",
+    filter_dict={
+        "model": ["llama3-8b-8192"],
+    },
+)
 
-bpy.ops.object.select_all(action='DESELECT')
-delete_empty_objects()
+# Configuration for the Llama vision model
+llama_vision_config = {
+    "cache_seed": 42,
+    "temperature": 0.0,
+    "config_list": config_list_llama_vision,
+    "timeout": 600,
+}
 
-# TODO: Generate the room with the room dimensions
-create_room(4.0, 4.0, 2.5)
+# Configuration for the Llama language model with JSON output
+llama_language_json_config = deepcopy(llama_vision_config)
+llama_language_json_config["config_list"] = config_list_llama_language
+llama_language_json_config["config_list"][0]["response_format"] = {"type": "json_object"}
+
+
+def get_corrector_agents():
+    # User Proxy Agent (human interaction proxy)
+    user_proxy = autogen.UserProxyAgent(
+        name="Admin",
+        system_message="A human admin.",
+        is_termination_msg=is_termination_msg,
+        human_input_mode="NEVER",
+        code_execution_config=False
+    )
+
+    # JSON Schema Debugger Agent
+    json_schema_debugger = JSONSchemaAgent(
+        name="Json_schema_debugger",
+        is_termination_msg=is_termination_msg,
+    )
+
+    # Spatial Corrector Agent using Groq Llama vision model for spatial conflict correction
+    spatial_corrector_agent = AssistantAgent(
+        name="Spatial_corrector_agent",
+        llm_config=llama_vision_config,
+        is_termination_msg=is_termination_msg,
+        human_input_mode="NEVER",
+        system_message=f"""
+        Spatial Corrector Agent. Whenever a user provides an object that doesn't fit the room due to spatial conflicts,
+        you will make changes to its "scene_graph" and "facing_object" keys so that these conflicts are resolved.
+        You will use the JSON Schema to validate the JSON object that the user provides.
+
+        For relative placement with other objects in the room, use the prepositions "on", "left of", "right of", "in front", "behind", "under".
+        For relative placement with room layout elements (walls, middle of the room, ceiling), use the prepositions "on", "in the corner".
+
+        Use only the following JSON Schema to save the corrected JSON object:
+        {layout_corrector_schema}
+        """
+    )
+
+    # Object Deletion Agent using Groq Llama language model for selecting non-essential objects
+    object_deletion_agent = AssistantAgent(
+        name="Object_deletion_agent",
+        llm_config=llama_language_json_config,
+        is_termination_msg=is_termination_msg,
+        human_input_mode="NEVER",
+        system_message=f"""
+        Object Deletion Agent. When the user provides a list of objects that don't fit the room, select one object to delete that would be the least essential for the room.
+
+        Example JSON output:
+        {deletion_schema}
+        """
+    )
+
+    # Return the agents
+    return user_proxy, json_schema_debugger, spatial_corrector_agent, object_deletion_agent

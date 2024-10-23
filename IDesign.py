@@ -1,54 +1,104 @@
-from autogen import GroupChatManager
+import autogen
 import json
 import re
-import networkx as nx
-
-from agents import create_agents
-from agents import is_termination_msg, gpt4_config
-from corrector_agents import get_corrector_agents
-from refiner_agents import get_refiner_agents
-
-from chats import GroupChat, ChatWithEngineer, LayoutCorrectorGroupChat, ObjectDeletionGroupChat, LayoutRefinerGroupChat 
-
-from utils import get_room_priors, extract_list_from_json
-from utils import preprocess_scene_graph, build_graph, remove_unnecessary_edges, handle_under_prepositions, get_conflicts, get_size_conflicts, get_object_from_scene_graph
-from utils import get_object_from_scene_graph, get_rotation, get_cluster_objects, clean_and_extract_edges
-from utils import get_cluster_size
-from utils import get_possible_positions, is_point_bbox, calculate_overlap, get_topological_ordering, place_object, get_depth, get_visualization
+from autogen.agentchat import GroupChatManager
+from agents import is_termination_msg
+from jsonschema import validate, ValidationError
+from agents import create_agents, llama_json_config, llama_engineer_json_config
+from chats import GroupChat
+from utils import (
+    get_room_priors, extract_list_from_json, preprocess_scene_graph,
+    build_graph, remove_unnecessary_edges, handle_under_prepositions,
+    get_conflicts, get_size_conflicts, get_object_from_scene_graph,
+    get_rotation, get_cluster_objects, clean_and_extract_edges,
+    get_cluster_size, get_possible_positions, is_point_bbox,
+    calculate_overlap, get_topological_ordering, place_object,
+    get_depth, get_visualization
+)
+from schemas import (
+    initial_schema, interior_designer_schema,
+    interior_architect_schema, engineer_schema
+)
 
 class IDesign:
     def __init__(self, no_of_objects, user_input, room_dimensions):
         self.no_of_objects = no_of_objects
         self.user_input = user_input
         self.room_dimensions = room_dimensions
-        self.room_priors = get_room_priors(self.room_dimensions)
         self.scene_graph = None
 
-    def create_initial_design(self):
-        user_proxy, json_schema_debugger, interior_designer, interior_architect, engineer = create_agents(self.no_of_objects)
+    def extract_json(self, response):
+        """Extracts the JSON portion from a response by cleaning unnecessary characters."""
+        if not response or len(response.strip()) == 0:
+            raise ValueError("Response is empty or invalid!")
+
+        # Use regex to remove unnecessary characters and extract valid JSON
+        cleaned_response = re.sub(r'```json|```|\\n|\\', '', response).strip()
+
+        # Print the raw response to inspect the content causing the issue
+        print("Raw response being processed:", repr(cleaned_response))  # Debugging line
+
+        # Identify where the JSON begins and ends
+        json_start = cleaned_response.find('{')
+        json_end = cleaned_response.rfind('}')
+
+        # Validate that JSON start and end indices are found
+        if json_start == -1 or json_end == -1 or json_end < json_start:
+            raise ValueError("No valid JSON found in the response!")
+
+        # Extract the valid JSON part
+        json_str = cleaned_response[json_start:json_end + 1]
         
+        # Validate JSON structure
+        try:
+            json_data = json.loads(json_str)  # Ensure the JSON is valid
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Invalid JSON structure: {e}")
+
+        return json_data
+
+
+    def validate_json_data(self, json_data, schema):
+        """Validates JSON data against the provided schema."""
+        try:
+            validate(instance=json_data, schema=schema)
+        except ValidationError as e:
+            raise ValidationError(f"JSON schema validation error: {e.message}")
+
+    def create_initial_design(self):
+        """Initiates the design process by interacting with agents and processing their responses."""
+        user_proxy, json_schema_debugger, interior_designer, interior_architect, engineer = create_agents(self.no_of_objects)
+
+        # Check if any of the agents returned by create_agents() are None
+        if None in (user_proxy, json_schema_debugger, interior_designer, interior_architect, engineer):
+            raise ValueError("One or more agents failed to initialize properly. Check the configuration of the agents.")
+        
+        # Create the group chat for initial design discussion
         groupchat = GroupChat(
             agents=[user_proxy, interior_designer, interior_architect],
             messages=[],
             max_round=3
         )
 
-        chat_with_engineer = ChatWithEngineer(
-            agents  =[user_proxy, engineer, json_schema_debugger],
+        # Group chat for engineer interactions
+        chat_with_engineer = GroupChat(
+            agents=[user_proxy, engineer, json_schema_debugger],
             messages=[],
             max_round=15
         )
 
-        manager = GroupChatManager(groupchat=groupchat, llm_config=gpt4_config, is_termination_msg=is_termination_msg)
+        # Ensure GroupChatManager has valid speaker selection
+        manager = GroupChatManager(groupchat=groupchat, is_termination_msg=is_termination_msg)
+        
         user_proxy.initiate_chat(
             manager,
             message=f"""
-            The room has the size {self.room_dimensions[0]}m x {self.room_dimensions[1]}m x {self.room_dimensions[2]}m
-            User Preference (in triple backquotes):
+            The room has the size {self.room_dimensions[0]}m x {self.room_dimensions[1]}m x {self.room_dimensions[2]}m.
+            User Preference:
             ```
-            {self.user_input}    
+            {self.user_input}
             ```
-            Room layout elements in the room (in triple backquotes):
+            Room layout elements:
             ```
             ['south_wall', 'north_wall', 'west_wall', 'east_wall', 'middle of the room', 'ceiling']
             ```
@@ -56,50 +106,130 @@ class IDesign:
             """,
         )
 
-        designer_response = json.loads(groupchat.messages[-2]["content"])
-        architect_response = json.loads(groupchat.messages[-1]["content"])
+        # Extract and clean the responses from designer and architect
+        try:
+            designer_response = groupchat.messages[-2]["content"]
+            architect_response = groupchat.messages[-1]["content"]
 
-        blocks_designer, blocks_architect = extract_list_from_json(designer_response), extract_list_from_json(architect_response)
-        if len(blocks_designer) != len(blocks_architect):
-            print("Lengths: ", len(blocks_designer), len(blocks_architect))
-            raise ValueError("The number of blocks from the designer and architect should be the same! Please generate again.")
-        
-        json_data = None
+            # Extract JSON from the designer and architect responses
+            designer_response_clean = self.extract_json(designer_response)
+            print("Extracted Designer JSON:", designer_response_clean)  # Debugging line
 
-        for d_block, a_block in zip(blocks_designer, blocks_architect):
-            engineer.reset(), json_schema_debugger.reset()
-            prompt = str(d_block) + "\n" + str(a_block)
+            architect_response_clean = self.extract_json(architect_response)
+            print("Extracted Architect JSON:", architect_response_clean)  # Debugging line
 
-            object_ids = [item["new_object_id"] for item in json_data["objects_in_room"]] if json_data is not None else []
+            # Load extracted JSON strings into dictionaries
+            designer_response_json = json.loads(designer_response_clean)
+            architect_response_json = json.loads(architect_response_clean)
 
-            manager = GroupChatManager(groupchat=chat_with_engineer, 
-                                       llm_config=gpt4_config, 
-                                       human_input_mode="NEVER", 
-                                       is_termination_msg=is_termination_msg)
+            # Validate designer's response
+            self.validate_json_data(designer_response_json, interior_designer_schema)
+
+            # Ensure "Placements" is present in Architect's response and validate the architect's JSON schema
+            for obj in architect_response_json.get("Objects", []):
+                if "Placements" not in obj or not obj["Placements"]:
+                    # Add default placement if missing
+                    obj["Placements"] = [{
+                        "placement": "middle of the room",  # Default value
+                        "proximity": "Not Adjacent",        # Default value
+                        "facing": "north_wall"              # Default value
+                    }]
+            
+            # Print Architect's response for debugging
+            print("Architect Response (Before Validation):", json.dumps(architect_response_json, indent=2))
+            
+            # Validate the architect's response after adding default placements
+            self.validate_json_data(architect_response_json, interior_architect_schema)
+
+        except (json.JSONDecodeError, ValidationError, IndexError) as e:
+            print(f"Error in response: {e}")
+            return
+
+        # Initialize the JSON data structure for storing the objects in the room
+        json_data = {"objects_in_room": []}
+
+        # Combine designer objects with their placements from the architect's response
+        for obj in designer_response_json.get('Objects', []):
+            matching_placement = next((p for p in architect_response_json["Objects"] if p["object_name"] == obj["object_name"]), None)
+            if matching_placement:
+                obj_data = {
+                    "new_object_id": obj["object_name"].lower().replace(" ", "_"),  # Create a new ID
+                    "style": obj["architecture_style"],
+                    "material": obj["material"],
+                    "size_in_meters": {
+                        "length": obj["bounding_box_size"]["length"],
+                        "width": obj["bounding_box_size"]["width"],
+                        "height": obj["bounding_box_size"]["height"]
+                    },
+                    "is_on_the_floor": True,  # Assuming all objects are on the floor
+                    "facing": matching_placement["Placements"][0]["facing"],
+                    "placement": {
+                        "room_layout_elements": [
+                            {
+                                "layout_element_id": matching_placement["Placements"][0]["placement"],
+                                "preposition": "on"  # Assuming "on" for simplicity
+                            }
+                        ],
+                        "objects_in_room": []  # To be filled later
+                    }
+                }
+                json_data["objects_in_room"].append(obj_data)
+
+        # Set the scene graph with the objects
+        self.scene_graph = json_data
+
+        # Continue conversation with the engineer if needed
+        for obj in json_data["objects_in_room"]:
+            engineer.reset()
+            json_schema_debugger.reset()
+
+            manager = GroupChatManager(groupchat=chat_with_engineer, is_termination_msg=is_termination_msg)
             user_proxy.initiate_chat(
                 manager,
-                message=f"""
-                Room layout elements in the room (in triple backquotes):
-                ```
-                ['south_wall', 'north_wall', 'west_wall', 'east_wall', 'middle of the floor', 'ceiling']
-                ```
-                Array of objects in the room (in triple backquotes):
-                ```
-                {object_ids}
-                ```
-                Objects to be placed in the room (in triple backquotes):
-                ```
-                {prompt}
-                ```
-                json
-                """,
+                message=json.dumps(obj)
             )
-            if json_data is None:
-                json_data = json.loads(chat_with_engineer.messages[-2]["content"])
-            else:
-                json_data["objects_in_room"] += json.loads(chat_with_engineer.messages[-2]["content"])["objects_in_room"]
-            
+
+            # Extract and validate the response from the engineer
+            raw_response_content = chat_with_engineer.messages[-2]["content"]
+            extracted_json_content = self.extract_json(raw_response_content)
+
+            if extracted_json_content:
+                try:
+                    parsed_json_data = json.loads(extracted_json_content)
+                    self.validate_json_data(parsed_json_data, engineer_schema)
+
+                    if "objects_in_room" in parsed_json_data:
+                        json_data["objects_in_room"].extend(parsed_json_data["objects_in_room"])
+                except (json.JSONDecodeError, ValidationError) as e:
+                    print(f"Error processing engineer response: {e}")
+
+        # Final scene graph with all objects placed in the room
         self.scene_graph = json_data
+
+
+    def match_objects_to_placements(self, objects, placements):
+        """Matches the objects from the designer's response to the architect's placements."""
+        object_placement_pairs = []
+        unmatched_objects = objects.copy()
+        unmatched_placements = placements.copy()
+
+        for obj in objects:
+            for placement in placements:
+                if obj["object_name"] == placement["object_name"]:
+                    object_placement_pairs.append((obj, [placement]))
+                    unmatched_objects.remove(obj)
+                    unmatched_placements.remove(placement)
+                    break
+
+        return object_placement_pairs, unmatched_objects, unmatched_placements
+
+    def handle_unmatched_objects(self, unmatched_objects):
+        """Handles any objects that do not have matching placements."""
+        print(f"Unmatched Objects: {unmatched_objects}")
+
+    def log_unmatched_placements(self, unmatched_placements):
+        """Logs any placements that do not have matching objects."""
+        print(f"Unmatched Placements: {unmatched_placements}")
 
     def correct_design(self, verbose=False, auto_prune=True):
         # Correct Spatial Conflicts
@@ -119,13 +249,14 @@ class IDesign:
         user_proxy, spatial_corrector_agent, json_schema_debugger, object_deletion_agent = get_corrector_agents()
 
         while len(conflicts) > 0:
-            spatial_corrector_agent.reset(), json_schema_debugger.reset()
+            spatial_corrector_agent.reset()
+            json_schema_debugger.reset()
             groupchat = LayoutCorrectorGroupChat(
-                agents  =[user_proxy, spatial_corrector_agent, json_schema_debugger],
+                agents=[user_proxy, spatial_corrector_agent, json_schema_debugger],
                 messages=[],
                 max_round=15
             )
-            manager = GroupChatManager(groupchat=groupchat, llm_config=gpt4_config, is_termination_msg=is_termination_msg)
+            manager = GroupChatManager(groupchat=groupchat, is_termination_msg=is_termination_msg)
             user_proxy.initiate_chat(
                 manager,
                 message=f"""
@@ -133,7 +264,7 @@ class IDesign:
                 """,
             )
             correction = groupchat.messages[-2]
-            pattern = r'```json\s*([^`]+)\s*```' # Match the json object
+            pattern = r'```json\s*([^`]+)\s*```'  # Match the JSON object
             match = re.search(pattern, correction["content"], re.DOTALL).group(1)
             correction_json = json.loads(match)
             corr_obj = get_object_from_scene_graph(correction_json["corrected_object"]["new_object_id"], scene_graph)
@@ -155,11 +286,11 @@ class IDesign:
             while len(size_conflicts) > 0:
                 object_deletion_agent.reset()
                 groupchat = ObjectDeletionGroupChat(
-                    agents  =[user_proxy, object_deletion_agent],
+                    agents=[user_proxy, object_deletion_agent],
                     messages=[],
                     max_round=2
                 )
-                manager = GroupChatManager(groupchat=groupchat, llm_config=gpt4_config, is_termination_msg=is_termination_msg)
+                manager = GroupChatManager(groupchat=groupchat, is_termination_msg=is_termination_msg)
                 user_proxy.initiate_chat(
                     manager,
                     message=f"""
@@ -180,6 +311,7 @@ class IDesign:
         self.scene_graph["objects_in_room"] = scene_graph
 
     def refine_design(self, verbose=False):
+        # Cluster objects for refinement
         cluster_dict = get_cluster_objects(self.scene_graph["objects_in_room"])
 
         inputs = []
@@ -220,13 +352,14 @@ class IDesign:
 
             user_proxy, layout_refiner, json_schema_debugger = get_refiner_agents()
 
-            layout_refiner.reset(), json_schema_debugger.reset()
+            layout_refiner.reset()
+            json_schema_debugger.reset()
             groupchat = LayoutRefinerGroupChat(
-                agents  =[user_proxy, layout_refiner, json_schema_debugger],
+                agents=[user_proxy, layout_refiner, json_schema_debugger],
                 messages=[],
                 max_round=15
             )
-            manager = GroupChatManager(groupchat=groupchat, llm_config=gpt4_config, is_termination_msg=is_termination_msg)
+            manager = GroupChatManager(groupchat=groupchat, is_termination_msg=is_termination_msg)
             user_proxy.initiate_chat(
                 manager,
                 message=f"""
@@ -262,12 +395,11 @@ class IDesign:
             edges, edges_to_flip = clean_and_extract_edges(new_relationships, parent_id, verbose=verbose)
 
             prep_correspondences ={
-                "left of" : "right of",
-                "right of" : "left of",
-                "in front" : "behind",
-                "behind" : "in front",
+                "left of": "right of",
+                "right of": "left of",
+                "in front": "behind",
+                "behind": "in front",
             }
-
 
             for obj in new_relationships["children_objects"]:
                 name_id = obj["name_id"]
@@ -278,16 +410,16 @@ class IDesign:
                         if to_flip:
                             corr_obj = get_object_from_scene_graph(r["name_id"], self.scene_graph["objects_in_room"])
                             corr_prep = prep_correspondences[r["preposition"]]
-                            corr_obj["placement"]["objects_in_room"].append({"object_id" : name_id, "preposition" : corr_prep, "is_adjacent" : r["is_adjacent"]})
+                            corr_obj["placement"]["objects_in_room"].append({"object_id": name_id, "preposition": corr_prep, "is_adjacent": r["is_adjacent"]})
                         else:
                             corr_obj = get_object_from_scene_graph(name_id, self.scene_graph["objects_in_room"])
-                            corr_obj["placement"]["objects_in_room"].append({"object_id" : r["name_id"], "preposition" : r["preposition"], "is_adjacent" : r["is_adjacent"]})
+                            corr_obj["placement"]["objects_in_room"].append({"object_id": r["name_id"], "preposition": r["preposition"], "is_adjacent": r["is_adjacent"]})
 
     def create_object_clusters(self, verbose=False):
         # Assign the rotations
         for obj in self.scene_graph["objects_in_room"]:
             rot = get_rotation(obj, self.scene_graph["objects_in_room"])
-            obj["rotation"] = {"z_angle" : rot}
+            obj["rotation"] = {"z_angle": rot}
         
         ROOM_LAYOUT_ELEMENTS = ["south_wall", "north_wall", "west_wall", "east_wall", "ceiling", "middle of the room"]
 
@@ -304,8 +436,8 @@ class IDesign:
                     print("Children: ", children_objs)
                     print("\n")
                 node_obj = get_object_from_scene_graph(node, self.scene_graph["objects_in_room"])
-                cluster_size = {"x_neg" : cluster_size["left of"], "x_pos" : cluster_size["right of"], "y_neg" : cluster_size["behind"], "y_pos" : cluster_size["in front"]}
-                node_obj["cluster"] = {"constraint_area" : cluster_size}
+                cluster_size = {"x_neg": cluster_size["left of"], "x_pos": cluster_size["right of"], "y_neg": cluster_size["behind"], "y_pos": cluster_size["in front"]}
+                node_obj["cluster"] = {"constraint_area": cluster_size}
 
     def backtrack(self, verbose=False):
         self.scene_graph = self.scene_graph["objects_in_room"] + self.room_priors
@@ -328,7 +460,7 @@ class IDesign:
                     overlap = calculate_overlap(overlap, pos)
             # If the overlap is a point bbox, assign the position
             if overlap is not None and is_point_bbox(overlap) and len(possible_pos) > 0:
-                item["position"] = {"x" : overlap[0], "y" : overlap[2], "z" : overlap[4]}
+                item["position"] = {"x": overlap[0], "y": overlap[2], "z": overlap[4]}
                 point_bbox[item["new_object_id"]] = True
         
         scene_graph_wo_layout = [item for item in self.scene_graph if item["new_object_id"] not in prior_ids]
@@ -396,6 +528,6 @@ class IDesign:
             get_visualization(self.scene_graph, self.room_priors)
     
     def to_json(self, filename="scene_graph.json"):
-        # Save the scene graph to a json file
+        # Save the scene graph to a JSON file
         with open(filename, "w") as file:
             json.dump(self.scene_graph, file, indent=4)
