@@ -114,7 +114,12 @@ class IDesign:
             # Extract JSON from the designer and architect responses
             designer_response_clean = self.extract_json(designer_response)
             print("Extracted Designer JSON:", designer_response_clean)  # Debugging line
-
+            print()
+            print()
+            print('ddd')
+            print(architect_response)
+            print()
+            print()
             architect_response_clean = self.extract_json(architect_response)
             print("Extracted Architect JSON:", architect_response_clean)  # Debugging line
 
